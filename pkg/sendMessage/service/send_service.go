@@ -714,7 +714,7 @@ func (s *sendService) sendLinkWithRetry(data *LinkStruct, instance *instance_mod
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendLink attempt %d/%d", instance.Id, attempt, maxRetries)
 
-		_, err := s.ensureClientConnectedWithRetry(instance.Id, 2)
+		client, err := s.ensureClientConnectedWithRetry(instance.Id, 2)
 		if err != nil {
 			if attempt == maxRetries {
 				return nil, err
@@ -722,20 +722,36 @@ func (s *sendService) sendLinkWithRetry(data *LinkStruct, instance *instance_mod
 			continue
 		}
 
-		matchedText := findURL(data.Text)
+		matchedText := data.Url
+		if matchedText == "" || !strings.Contains(data.Text, matchedText) {
+			matchedText = findURL(data.Text)
+		}
 
-		if matchedText != "" {
+		// Prefer metadata supplied by a trusted caller. This avoids fetching the
+		// same public page a second time immediately before dispatch, which can
+		// produce an incomplete preview despite the caller having already
+		// validated its title, description and image.
+		if data.Title == "" || data.Description == "" || data.ImgUrl == "" {
 			title, description, imgUrl, err := fetchLinkMetadata(matchedText)
 			if err != nil {
-				if attempt == maxRetries {
-					return nil, err
+				if data.Title == "" && data.Description == "" && data.ImgUrl == "" {
+					if attempt == maxRetries {
+						return nil, err
+					}
+					continue
 				}
-				continue
+				s.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Link metadata fallback failed; keeping supplied preview fields: %v", instance.Id, err)
+			} else {
+				if data.Title == "" {
+					data.Title = title
+				}
+				if data.Description == "" {
+					data.Description = description
+				}
+				if data.ImgUrl == "" {
+					data.ImgUrl = imgUrl
+				}
 			}
-
-			data.Title = title
-			data.Description = description
-			data.ImgUrl = imgUrl
 		}
 
 		var fileData []byte
@@ -751,16 +767,38 @@ func (s *sendService) sendLinkWithRetry(data *LinkStruct, instance *instance_mod
 			fileData, _ = io.ReadAll(resp.Body)
 		}
 
-		previewType := waE2E.ExtendedTextMessage_VIDEO
+		previewType := waE2E.ExtendedTextMessage_IMAGE
+		jpegThumbnail := makeJPEGThumbnail(fileData, 72)
 		msg := &waE2E.Message{
 			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
 				Text:          &data.Text,
 				Title:         &data.Title,
 				MatchedText:   &matchedText,
-				JPEGThumbnail: fileData,
+				JPEGThumbnail: jpegThumbnail,
 				Description:   &data.Description,
 				PreviewType:   &previewType,
 			},
+		}
+
+		// WhatsApp renders a large native link preview only when the thumbnail is
+		// uploaded with the link-thumbnail media keys and its upload metadata is
+		// present in the ExtendedTextMessage. Keep the inline thumbnail above as a
+		// safe fallback if the upload is unavailable.
+		if previewImage := makeJPEGThumbnail(fileData, 800); len(previewImage) > 0 {
+			if previewSize, decodeErr := jpeg.DecodeConfig(bytes.NewReader(previewImage)); decodeErr != nil {
+				s.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Unable to decode high-quality link preview image: %v", instance.Id, decodeErr)
+			} else if uploaded, uploadErr := client.Upload(context.Background(), previewImage, whatsmeow.MediaLinkThumbnail); uploadErr != nil {
+				s.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Unable to upload high-quality link preview; sending standard preview: %v", instance.Id, uploadErr)
+			} else {
+				msg.ExtendedTextMessage.JPEGThumbnail = previewImage
+				msg.ExtendedTextMessage.MediaKey = uploaded.MediaKey
+				msg.ExtendedTextMessage.ThumbnailDirectPath = proto.String(uploaded.DirectPath)
+				msg.ExtendedTextMessage.ThumbnailSHA256 = uploaded.FileSHA256
+				msg.ExtendedTextMessage.ThumbnailEncSHA256 = uploaded.FileEncSHA256
+				msg.ExtendedTextMessage.ThumbnailWidth = proto.Uint32(uint32(previewSize.Width))
+				msg.ExtendedTextMessage.ThumbnailHeight = proto.Uint32(uint32(previewSize.Height))
+				s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] High-quality link preview uploaded (%dx%d)", instance.Id, previewSize.Width, previewSize.Height)
+			}
 		}
 
 		message, err := s.SendMessage(instance, msg, "ExtendedTextMessage", &SendDataStruct{
