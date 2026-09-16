@@ -31,6 +31,7 @@ import (
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
+	"golang.org/x/image/draw"
 	"golang.org/x/net/html"
 	"google.golang.org/protobuf/proto"
 )
@@ -2120,11 +2121,10 @@ func stringPointer(s string) *string {
 	return &s
 }
 
-// makeJPEGThumbnail decodes raw image bytes and produces a small JPEG
-// thumbnail suitable for the JPEGThumbnail field of WhatsApp media messages.
-// The thumbnail keeps the original aspect ratio and is capped at maxWidth
-// pixels wide. It returns nil if the image cannot be decoded so callers can
-// fall back to sending the message without a preview thumbnail.
+// makeJPEGThumbnail decodes raw image bytes and produces a JPEG thumbnail
+// suitable for WhatsApp media messages. The thumbnail keeps the original
+// aspect ratio and is capped at maxWidth pixels wide. Large previews use a
+// higher quality encoder, while small fallback thumbnails remain compact.
 func makeJPEGThumbnail(fileData []byte, maxWidth int) []byte {
 	if maxWidth < 1 {
 		maxWidth = 72
@@ -2152,16 +2152,14 @@ func makeJPEGThumbnail(fileData []byte, maxWidth int) []byte {
 	}
 
 	thumbImg := image.NewRGBA(image.Rect(0, 0, thumbWidth, thumbHeight))
-	for y := 0; y < thumbHeight; y++ {
-		for x := 0; x < thumbWidth; x++ {
-			srcX := x * srcWidth / thumbWidth
-			srcY := y * srcHeight / thumbHeight
-			thumbImg.Set(x, y, img.At(srcX+bounds.Min.X, srcY+bounds.Min.Y))
-		}
-	}
+	draw.CatmullRom.Scale(thumbImg, thumbImg.Bounds(), img, bounds, draw.Over, nil)
 
 	var thumbBuf bytes.Buffer
-	if err := jpeg.Encode(&thumbBuf, thumbImg, &jpeg.Options{Quality: 50}); err != nil {
+	quality := 50
+	if maxWidth >= 800 {
+		quality = 85
+	}
+	if err := jpeg.Encode(&thumbBuf, thumbImg, &jpeg.Options{Quality: quality}); err != nil {
 		return nil
 	}
 	return thumbBuf.Bytes()
