@@ -715,7 +715,7 @@ func (s *sendService) sendLinkWithRetry(data *LinkStruct, instance *instance_mod
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendLink attempt %d/%d", instance.Id, attempt, maxRetries)
 
-		client, err := s.ensureClientConnectedWithRetry(instance.Id, 2)
+		_, err := s.ensureClientConnectedWithRetry(instance.Id, 2)
 		if err != nil {
 			if attempt == maxRetries {
 				return nil, err
@@ -769,7 +769,18 @@ func (s *sendService) sendLinkWithRetry(data *LinkStruct, instance *instance_mod
 		}
 
 		previewType := waE2E.ExtendedTextMessage_IMAGE
-		jpegThumbnail := makeJPEGThumbnail(fileData, 72)
+		// Embed the preview image directly as the inline JPEGThumbnail. WhatsApp
+		// Desktop/Web only render these bytes as-is for ExtendedTextMessage
+		// previews; they do not fetch/decrypt a separately uploaded "large"
+		// thumbnail media the way some mobile clients tolerate. Previously
+		// uploading via client.Upload(..., whatsmeow.MediaLinkThumbnail) and
+		// registering MediaKey/ThumbnailDirectPath/ThumbnailSHA256 here left
+		// Desktop/Web stuck showing a washed-out loading placeholder instead of
+		// the real image, even though mobile rendered it fine.
+		jpegThumbnail := prepareHighQualityLinkPreview(fileData)
+		if len(jpegThumbnail) == 0 {
+			jpegThumbnail = makeJPEGThumbnail(fileData, 72)
+		}
 		msg := &waE2E.Message{
 			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
 				Text:          &data.Text,
@@ -779,27 +790,6 @@ func (s *sendService) sendLinkWithRetry(data *LinkStruct, instance *instance_mod
 				Description:   &data.Description,
 				PreviewType:   &previewType,
 			},
-		}
-
-		// WhatsApp renders a large native link preview only when the thumbnail is
-		// uploaded with the link-thumbnail media keys and its upload metadata is
-		// present in the ExtendedTextMessage. Keep the inline thumbnail above as a
-		// safe fallback if the upload is unavailable.
-		if previewImage := prepareHighQualityLinkPreview(fileData); len(previewImage) > 0 {
-			if previewSize, decodeErr := jpeg.DecodeConfig(bytes.NewReader(previewImage)); decodeErr != nil {
-				s.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Unable to decode high-quality link preview image: %v", instance.Id, decodeErr)
-			} else if uploaded, uploadErr := client.Upload(context.Background(), previewImage, whatsmeow.MediaLinkThumbnail); uploadErr != nil {
-				s.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Unable to upload high-quality link preview; sending standard preview: %v", instance.Id, uploadErr)
-			} else {
-				msg.ExtendedTextMessage.JPEGThumbnail = previewImage
-				msg.ExtendedTextMessage.MediaKey = uploaded.MediaKey
-				msg.ExtendedTextMessage.ThumbnailDirectPath = proto.String(uploaded.DirectPath)
-				msg.ExtendedTextMessage.ThumbnailSHA256 = uploaded.FileSHA256
-				msg.ExtendedTextMessage.ThumbnailEncSHA256 = uploaded.FileEncSHA256
-				msg.ExtendedTextMessage.ThumbnailWidth = proto.Uint32(uint32(previewSize.Width))
-				msg.ExtendedTextMessage.ThumbnailHeight = proto.Uint32(uint32(previewSize.Height))
-				s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] High-quality link preview uploaded (%dx%d)", instance.Id, previewSize.Width, previewSize.Height)
-			}
 		}
 
 		message, err := s.SendMessage(instance, msg, "ExtendedTextMessage", &SendDataStruct{
